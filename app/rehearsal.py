@@ -51,6 +51,38 @@ class Location:
     page_index: int  # 已存方案中的 1 基页码
 
 
+@dataclass(frozen=True)
+class TurnCue:
+    """一次排练翻页提示。
+
+    仅当演奏序列中相邻两次发声所属页码不同时生成；演奏结束不生成提示。
+
+    :param boundary_seconds: 两次发声之间的边界时刻（秒，以演奏开始为 0），
+        即前一小节结束、后一小节开始的瞬间
+    :param from_page: 翻页前的页码（前一小节所在页，1 基）
+    :param to_page: 翻页后的页码（后一小节所在页，1 基）
+    :param from_measure: 前一小节的原谱 0 基小节号
+    :param to_measure: 后一小节的原谱 0 基小节号
+    :param from_playthrough: 前一小节所属重复段内第几遍（1 基）
+    :param to_playthrough: 后一小节所属重复段内第几遍（1 基）
+    :param direction: ``"forward"`` 前进翻页（页码增大）或
+        ``"backward"`` 回翻（页码减小，通常由重复段回跳引起）
+    :param silence_seconds: 前一小节之后的静默秒数（取自已存规划）
+    :param sufficient: 该静默是否不低于方案的最低翻页时间
+    """
+
+    boundary_seconds: float
+    from_page: int
+    to_page: int
+    from_measure: int
+    to_measure: int
+    from_playthrough: int
+    to_playthrough: int
+    direction: str
+    silence_seconds: float
+    sufficient: bool
+
+
 # (起始小节, 结束小节, 演奏次数)，小节均为 0 基、两端皆含
 Repeat = Tuple[int, int, int]
 
@@ -185,6 +217,52 @@ class Rehearsal:
             except RehearsalError as exc:
                 raise RehearsalError(f"第 {idx + 1} 个时间戳：{exc}") from exc
         return results
+
+    def turn_cues(
+        self,
+        silences: Sequence[float],
+        min_turn_time: float,
+    ) -> List[TurnCue]:
+        """按实际演奏序列生成排练翻页提示。
+
+        逐对考察相邻的两次发声：仅当二者所属页码不同时生成一条提示，
+        因此重复段回跳是否翻页也按回跳两端实际相邻小节判定，与原谱分页
+        位置无关。演奏结束（最后一次发声之后）不生成提示。
+
+        :param silences: 已存规划中每个原谱小节之后的静默秒数，长度必须
+            等于规划小节数
+        :param min_turn_time: 方案的最低翻页时间（秒），用于判断每次提示
+            前的静默是否充足
+        """
+        if len(silences) != self.measure_count:
+            raise RehearsalError(
+                f"静默秒数数组长度（{len(silences)}）"
+                f"与规划小节数（{self.measure_count}）不符"
+            )
+
+        cues: List[TurnCue] = []
+        for k in range(len(self.events) - 1):
+            prev, nxt = self.events[k], self.events[k + 1]
+            from_page = self.page_of(prev.measure)
+            to_page = self.page_of(nxt.measure)
+            if from_page == to_page:
+                continue
+            silence = float(silences[prev.measure])
+            cues.append(
+                TurnCue(
+                    boundary_seconds=self.start_times[k + 1],
+                    from_page=from_page,
+                    to_page=to_page,
+                    from_measure=prev.measure,
+                    to_measure=nxt.measure,
+                    from_playthrough=prev.playthrough,
+                    to_playthrough=nxt.playthrough,
+                    direction="forward" if to_page > from_page else "backward",
+                    silence_seconds=silence,
+                    sufficient=silence + _eps(min_turn_time) >= min_turn_time,
+                )
+            )
+        return cues
 
 
 def prepare_rehearsal(
