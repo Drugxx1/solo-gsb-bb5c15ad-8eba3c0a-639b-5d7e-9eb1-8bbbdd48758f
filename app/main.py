@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from .planner import Plan, PlanningError, plan_pages
 from .rehearsal import (
     Location,
+    PageTurnCue,
     RehearsalError,
     prepare_rehearsal,
 )
@@ -139,8 +140,11 @@ class RepeatSectionIn(BaseModel):
         return self
 
 
-class RehearsalLocateRequest(BaseModel):
-    """排练录音时间戳定位请求体。"""
+class RehearsalParamsRequest(BaseModel):
+    """排练参数：每小节拍数、速度与互不相交的重复段。
+
+    时间戳定位与翻页提示共用这组参数，沿用同一套输入校验。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -153,12 +157,9 @@ class RehearsalLocateRequest(BaseModel):
         default_factory=list,
         description="若干不相交且不嵌套的重复段（起止小节均含、演奏次数 2~4）",
     )
-    timestamps: List[float] = Field(
-        ..., description="排练录音时间戳数组（秒，以演奏开始为 0）"
-    )
 
     @model_validator(mode="after")
-    def _validate(self) -> "RehearsalLocateRequest":
+    def _validate(self) -> "RehearsalParamsRequest":
         if any(b != b or b in (float("inf"), float("-inf")) for b in self.beats_per_measure):
             raise ValueError("beats_per_measure 中每个拍数必须是有限数值")
         if any(b <= 0 for b in self.beats_per_measure):
@@ -170,6 +171,18 @@ class RehearsalLocateRequest(BaseModel):
             raise ValueError("tempo_bpm 必须是有限数值")
         if self.tempo_bpm <= 0:
             raise ValueError("tempo_bpm（每分钟拍数）必须为正数")
+        return self
+
+
+class RehearsalLocateRequest(RehearsalParamsRequest):
+    """排练录音时间戳定位请求体。"""
+
+    timestamps: List[float] = Field(
+        ..., description="排练录音时间戳数组（秒，以演奏开始为 0）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_timestamps(self) -> "RehearsalLocateRequest":
         if any(t != t or t in (float("inf"), float("-inf")) for t in self.timestamps):
             raise ValueError("时间戳必须是有限数值（不接受 NaN 或 Infinity）")
         if any(t < 0 for t in self.timestamps):
@@ -203,6 +216,65 @@ def _location_to_out(loc: Location) -> LocationOut:
         playthrough=loc.playthrough,
         beat_offset=loc.beat_offset,
         page_index=loc.page_index,
+    )
+
+
+# ---------------------------------------- 排练翻页提示
+
+
+class PageTurnCueOut(BaseModel):
+    """一次翻页提示：相邻两个演奏小节恰好分属不同页时生成。"""
+
+    time_seconds: float = Field(
+        ..., description="边界秒数：后一小节的起点（前一小节静默结束处）"
+    )
+    from_page: int = Field(..., description="前一小节所在页码（1 基）")
+    to_page: int = Field(..., description="后一小节所在页码（1 基）")
+    from_measure: int = Field(..., description="前一小节的原谱小节号（0 基）")
+    from_playthrough: int = Field(
+        ..., description="前一小节的重复遍号（1 基）；非重复段小节恒为 1"
+    )
+    to_measure: int = Field(..., description="后一小节的原谱小节号（0 基）")
+    to_playthrough: int = Field(
+        ..., description="后一小节的重复遍号（1 基）；非重复段小节恒为 1"
+    )
+    direction: Literal["forward", "backward"] = Field(
+        ..., description="翻页方向：forward 向后翻，backward 重复段回跳后的回翻"
+    )
+    silence_seconds: float = Field(
+        ..., description="前一小节之后的静默秒数（取规划入参）"
+    )
+    sufficient: bool = Field(
+        ..., description="静默秒数是否不低于方案的最低翻页时间"
+    )
+
+
+class RehearsalCuesResponse(BaseModel):
+    id: str
+    request: RehearsalParamsRequest
+    total_duration: float = Field(
+        ..., description="按重复段展开后的演奏总时长（秒）"
+    )
+    min_turn_time: float = Field(
+        ..., description="方案的最低翻页时间（秒），取自保存规划时的入参"
+    )
+    cues: List[PageTurnCueOut] = Field(
+        ..., description="按演奏时间升序排列的翻页提示；同页相邻小节不产生提示"
+    )
+
+
+def _cue_to_out(cue: PageTurnCue) -> PageTurnCueOut:
+    return PageTurnCueOut(
+        time_seconds=cue.time_seconds,
+        from_page=cue.from_page,
+        to_page=cue.to_page,
+        from_measure=cue.from_measure,
+        from_playthrough=cue.from_playthrough,
+        to_measure=cue.to_measure,
+        to_playthrough=cue.to_playthrough,
+        direction=cue.direction,
+        silence_seconds=cue.silence_seconds,
+        sufficient=cue.sufficient,
     )
 
 
@@ -293,6 +365,57 @@ def locate_rehearsal_timestamps(
         request=payload,
         total_duration=rehearsal.total_duration,
         locations=[_location_to_out(loc) for loc in locations],
+    )
+
+
+@app.post(
+    "/api/v1/plans/{plan_id}/rehearsal/cues",
+    response_model=RehearsalCuesResponse,
+)
+def rehearsal_page_turn_cues(
+    plan_id: str, payload: RehearsalParamsRequest
+) -> RehearsalCuesResponse:
+    """为已保存的规划生成排练翻页提示。
+
+    依据提交的每小节拍数、速度与重复段，复用与时间戳定位相同的演奏顺序与
+    时间轴；仅当相邻两个演奏小节所属页变化时生成提示，重复段回跳按实际相邻
+    小节判定（可能回翻），演奏结束不生成提示。每次提示用前一小节后的静默
+    秒数与方案的最低翻页时间比较，给出是否充足。
+    """
+    assert store is not None
+    record = store.get(plan_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"规划结果不存在：{plan_id}")
+
+    plan_request = PlanRequest(**record["request"])
+    plan_result = PlanResult(**record["result"])
+    page_starts = [p.start_measure for p in plan_result.pages]
+
+    try:
+        rehearsal = prepare_rehearsal(
+            measure_count=len(plan_request.measure_heights),
+            beats_per_measure=payload.beats_per_measure,
+            tempo_bpm=payload.tempo_bpm,
+            repeats=[
+                (r.start_measure, r.end_measure, r.play_count)
+                for r in payload.repeats
+            ],
+            page_starts=page_starts,
+        )
+        cues = rehearsal.build_page_turn_cues(
+            silence_seconds=plan_request.silence_seconds,
+            min_turn_time=plan_request.min_turn_time,
+        )
+    except RehearsalError as exc:
+        # 数组长度不符 / 重复段重叠等语义错误：明确报错
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return RehearsalCuesResponse(
+        id=record["id"],
+        request=payload,
+        total_duration=rehearsal.total_duration,
+        min_turn_time=plan_request.min_turn_time,
+        cues=[_cue_to_out(cue) for cue in cues],
     )
 
 

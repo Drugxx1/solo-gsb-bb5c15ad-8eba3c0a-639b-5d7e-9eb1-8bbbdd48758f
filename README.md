@@ -55,6 +55,7 @@ docker run -d -p 8000:8000 -v "$(pwd)/data:/data" -e DATA_DIR=/data page-turn-pl
 - 提交规划：`POST http://localhost:8000/api/v1/plans`
 - 按 ID 查询：`GET http://localhost:8000/api/v1/plans/{id}`
 - 排练录音时间戳定位：`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/locate`
+- 排练翻页提示：`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/cues`
 
 ### 1. 提交规划
 
@@ -191,6 +192,69 @@ curl -X POST http://localhost:8000/api/v1/plans/2fb0c76562414d59ae41c49accabbd78
 
 定位规则：小节 `i` 第 `p` 遍的时间区间为 `[t, t + 60·beats[i]/tempo_bpm)`；时间戳等于某遍起点时归该遍小节，等于末尾总时长时报越界错误。
 
+### 4. 排练翻页提示
+
+`POST http://localhost:8000/api/v1/plans/{id}/rehearsal/cues`
+
+对一个**已保存的规划**提交排练参数（每小节拍数、速度、互不相交的重复段），复用与时间戳定位相同的演奏顺序与时间轴，给出演奏过程中的全部**翻页提示**：仅当相邻两个演奏小节所属页发生变化时生成一条提示；重复段回跳按实际相邻小节判定，因此可能出现**回翻**提示；演奏结束（最后一个小节之后）不生成提示。每次提示取**前一小节之后的静默秒数**与方案保存时的最低翻页时间比较，给出该次翻页时间是否充足。
+
+请求体（JSON）：与定位接口的排练参数完全一致（沿用同一套校验），但**不含** `timestamps`；`repeats` 可省略。
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `beats_per_measure` | number[] | 与原小节等长的每小节拍数，长度必须等于规划小节数、元素为正 |
+| `tempo_bpm` | number | 每分钟拍数（BPM），正数 |
+| `repeats` | object[] | 若干**不相交且不嵌套**的重复段（可省略）；首尾相邻允许，共享小节即报错 |
+| `repeats[].start_measure` / `end_measure` / `play_count` | number | 重复段起止小节（0 基、均含）与演奏次数 `2～4` |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/plans/2fb0c76562414d59ae41c49accabbd78/rehearsal/cues \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "beats_per_measure": [4, 4, 4, 4],
+    "tempo_bpm": 120,
+    "repeats": [
+      {"start_measure": 1, "end_measure": 2, "play_count": 2}
+    ]
+  }'
+```
+
+上例中实际演奏序列为 `0, 1, 2, 1, 2, 3`，每小节 2 秒；方案页 1 为小节 0..1、页 2 为小节 2..3。第 2→1 小节（遍 2）是重复段回跳，页码由 2 回到 1，产生回翻提示。响应 `200`：
+
+```json
+{
+  "id": "2fb0c76562414d59ae41c49accabbd78",
+  "request": { "...": "回显排练参数" },
+  "total_duration": 12.0,
+  "min_turn_time": 2.0,
+  "cues": [
+    {"time_seconds": 4.0, "from_page": 1, "to_page": 2,
+     "from_measure": 1, "from_playthrough": 1,
+     "to_measure": 2, "to_playthrough": 1,
+     "direction": "forward", "silence_seconds": 5.0, "sufficient": true},
+    {"time_seconds": 6.0, "from_page": 2, "to_page": 1,
+     "from_measure": 2, "from_playthrough": 1,
+     "to_measure": 1, "to_playthrough": 2,
+     "direction": "backward", "silence_seconds": 1.0, "sufficient": false},
+    {"time_seconds": 8.0, "from_page": 1, "to_page": 2,
+     "from_measure": 1, "from_playthrough": 2,
+     "to_measure": 2, "to_playthrough": 2,
+     "direction": "forward", "silence_seconds": 5.0, "sufficient": true}
+  ]
+}
+```
+
+结果字段说明（`cues` 按演奏时间升序排列）：
+
+- `time_seconds`：边界秒数，即**后一小节的起点**（前一小节静默结束处），以演奏开始为 0；
+- `from_page` / `to_page`：前、后相邻演奏小节所属的 **1 基页码**；仅当二者不同才生成提示；
+- `from_measure` / `to_measure`：前、后小节的**原谱 0 基小节号**；
+- `from_playthrough` / `to_playthrough`：前、后小节的重复段**遍号**（1 基；非重复段小节恒为 1）；
+- `direction`：`forward` 为向后翻（页码增大），`backward` 为重复段回跳导致的回翻；
+- `silence_seconds`：前一小节之后的静默秒数（取自规划入参 `silence_seconds[from_measure]`）；
+- `sufficient`：该静默秒数是否不低于方案的最低翻页时间 `min_turn_time`（响应中一并回显）；
+- `total_duration`：按重复段展开后的演奏总时长（秒）；整篇只有一页时 `cues` 为空数组。
+
 ### 错误响应
 
 | 状态码 | 触发条件 |
@@ -200,7 +264,8 @@ curl -X POST http://localhost:8000/api/v1/plans/2fb0c76562414d59ae41c49accabbd78
 | `422` | 无合法方案：`无合法翻页方案：在满足最低翻页时间的静默位置无法完成分页…` |
 | `404` | 按 ID 查询无记录 |
 | `404` | 排练定位时规划不存在：`规划结果不存在：{id}` |
-| `422` | `beats_per_measure 数组长度（…）与规划小节数（…）不符` |
+| `404` | 排练翻页提示时规划不存在：`规划结果不存在：{id}` |
+| `422` | `beats_per_measure 数组长度（…）与规划小节数（…）不符`（定位与翻页提示共用） |
 | `422` | 重复段重叠或嵌套：`重复段 [a..b] 与 [c..d] 重叠或嵌套：…（首尾相邻允许）` |
 | `422` | 重复段演奏次数超出 2～4，或起止小节越界 / 起始晚于结束 |
 | `422` | 时间戳超出总时长或为负：`第 k 个时间戳：时间戳 … 秒超出演奏总时长 … 秒…` |
@@ -225,4 +290,4 @@ uvicorn app.main:app --reload            # 本地启动
 python -m pip install pytest && python -m pytest -q   # 运行测试
 ```
 
-测试包含 200 组随机用例与穷举全部分页方案的结果对照、边界条件与 10 万小节规模性能用例，以及排练重复段展开、左闭右开边界定位、页码映射与接口端到端用例。
+测试包含 200 组随机用例与穷举全部分页方案的结果对照、边界条件与 10 万小节规模性能用例，以及排练重复段展开、左闭右开边界定位、页码映射、排练翻页提示（含重复段回翻与静默充足判定）与接口端到端用例。

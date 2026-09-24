@@ -51,6 +51,22 @@ class Location:
     page_index: int  # 已存方案中的 1 基页码
 
 
+@dataclass(frozen=True)
+class PageTurnCue:
+    """一次排练翻页提示：相邻两个演奏小节恰好分属不同页时生成。"""
+
+    time_seconds: float  # 边界秒数：后一小节的起点（即前一小节静默结束处）
+    from_page: int  # 前一小节所在页码（1 基）
+    to_page: int  # 后一小节所在页码（1 基）
+    from_measure: int  # 前一小节原谱 0 基小节号
+    from_playthrough: int  # 前一小节的重复遍号（非重复段为 1）
+    to_measure: int  # 后一小节原谱 0 基小节号
+    to_playthrough: int  # 后一小节的重复遍号（非重复段为 1）
+    direction: str  # "forward"（向后翻）或 "backward"（回翻）
+    silence_seconds: float  # 前一小节之后的静默秒数（取规划入参）
+    sufficient: bool  # 静默秒数是否不低于方案的最低翻页时间
+
+
 # (起始小节, 结束小节, 演奏次数)，小节均为 0 基、两端皆含
 Repeat = Tuple[int, int, int]
 
@@ -185,6 +201,52 @@ class Rehearsal:
             except RehearsalError as exc:
                 raise RehearsalError(f"第 {idx + 1} 个时间戳：{exc}") from exc
         return results
+
+    def build_page_turn_cues(
+        self,
+        silence_seconds: Sequence[float],
+        min_turn_time: float,
+    ) -> List[PageTurnCue]:
+        """遍历实际演奏序列的相邻小节对，在页码变化处生成翻页提示。
+
+        重复段回跳（如段末小节回到段首小节）同样按相邻演奏事件的页码变化
+        判定，因此可能出现回翻提示；演奏结束（最后一个事件之后）不生成提示。
+
+        :param silence_seconds: 规划入参中每个原谱小节之后的静默秒数；
+            每次提示取“前一小节”对应的静默值
+        :param min_turn_time: 规划入参中的最低翻页时间，用于判定静默是否充足
+        """
+        if len(silence_seconds) != self.measure_count:
+            raise RehearsalError(
+                f"silence_seconds 数组长度（{len(silence_seconds)}）"
+                f"与规划小节数（{self.measure_count}）不符"
+            )
+
+        cues: List[PageTurnCue] = []
+        for k in range(1, len(self.events)):
+            prev_event = self.events[k - 1]
+            event = self.events[k]
+            prev_page = self.page_of(prev_event.measure)
+            page = self.page_of(event.measure)
+            if page == prev_page:
+                continue
+            # 边界秒数：第 k 个事件（后一小节）的起点
+            boundary = self.start_times[k]
+            silence = float(silence_seconds[prev_event.measure])
+            cue = PageTurnCue(
+                time_seconds=round(boundary, 9) + 0.0,
+                from_page=prev_page,
+                to_page=page,
+                from_measure=prev_event.measure,
+                from_playthrough=prev_event.playthrough,
+                to_measure=event.measure,
+                to_playthrough=event.playthrough,
+                direction="forward" if page > prev_page else "backward",
+                silence_seconds=silence,
+                sufficient=silence + _eps(min_turn_time) >= min_turn_time,
+            )
+            cues.append(cue)
+        return cues
 
 
 def prepare_rehearsal(
